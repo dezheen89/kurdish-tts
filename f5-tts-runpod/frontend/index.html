@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="ckb" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>دەنگ — دەقت بکە بە دەنگ</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #1c1a17;
+    --paper: #f6f0e6;
+    --rust: #b5481f;
+    --rust-dim: #b5481f33;
+    --line: #d8cdb8;
+    --muted: #7a7266;
+    --ok: #3f6b4a;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Noto Sans Arabic', sans-serif;
+    min-height: 100vh;
+  }
+
+  .wrap {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 48px 24px 80px;
+  }
+
+  header {
+    margin-bottom: 40px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 24px;
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    direction: ltr;
+    text-align: left;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--rust);
+    margin-bottom: 10px;
+  }
+
+  h1 {
+    font-size: 32px;
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+
+  .sub {
+    color: var(--muted);
+    font-size: 15px;
+    margin: 0;
+  }
+
+  .panel {
+    background: #fffdf9;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 28px;
+    margin-bottom: 20px;
+  }
+
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-weight: 500;
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Noto Sans Arabic', sans-serif;
+    font-size: 17px;
+    line-height: 1.7;
+    resize: vertical;
+  }
+
+  textarea:focus, input:focus, button:focus-visible {
+    outline: 2px solid var(--rust);
+    outline-offset: 1px;
+  }
+
+  .row {
+    display: flex;
+    gap: 16px;
+    margin-top: 16px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+
+  .field { flex: 1; min-width: 140px; }
+
+  input[type="text"], input[type="number"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+  }
+
+  button.generate {
+    background: var(--rust);
+    color: #fff;
+    border: none;
+    padding: 14px 28px;
+    border-radius: 3px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: 'Noto Sans Arabic', sans-serif;
+    transition: background 0.15s ease;
+    white-space: nowrap;
+  }
+
+  button.generate:hover { background: #973a18; }
+  button.generate:disabled { background: var(--muted); cursor: not-allowed; }
+
+  .footer-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 20px;
+    gap: 16px;
+  }
+
+  .charcount {
+    font-family: 'IBM Plex Mono', monospace;
+    direction: ltr;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .status {
+    margin-top: 18px;
+    font-family: 'IBM Plex Mono', monospace;
+    direction: ltr;
+    font-size: 13px;
+    display: none;
+    padding: 10px 12px;
+    border-radius: 3px;
+  }
+
+  .status.show { display: block; }
+  .status.busy { background: #00000008; color: var(--muted); }
+  .status.error { background: #b5481f14; color: var(--rust); }
+  .status.success { background: #3f6b4a14; color: var(--ok); }
+
+  .player {
+    margin-top: 20px;
+    display: none;
+  }
+
+  .player.show { display: block; }
+
+  audio {
+    width: 100%;
+  }
+
+  .config-toggle {
+    font-family: 'IBM Plex Mono', monospace;
+    direction: ltr;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    background: none;
+    border: none;
+    padding: 0;
+    margin-top: 24px;
+  }
+
+  .config {
+    display: none;
+    margin-top: 16px;
+    direction: ltr;
+  }
+
+  .config.show { display: block; }
+
+  .config label { direction: ltr; }
+
+  footer {
+    text-align: center;
+    margin-top: 40px;
+    font-family: 'IBM Plex Mono', monospace;
+    direction: ltr;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="eyebrow">CENTRAL KURDISH · TEXT-TO-SPEECH</div>
+      <h1>دەنگ</h1>
+      <p class="sub">دەقی کوردی سۆرانی بنووسە، گوێی لێ بگرە</p>
+    </header>
+
+    <div class="panel">
+      <label for="gen-text">دەقەکە</label>
+      <textarea id="gen-text" placeholder="دەقەکەت لێرە بنووسە…">سڵاو، باشیت چۆنیت؟</textarea>
+
+      <div class="row" style="margin-top: 16px;">
+        <div class="field">
+          <label for="voice-select">دەنگ</label>
+          <select id="voice-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:3px; background:var(--paper); color:var(--ink); font-family:'Noto Sans Arabic', sans-serif; font-size:14px;">
+            <option value="audiobook-female">Audiobook — Female</option>
+            <option value="audiobook-male">Audiobook — Male</option>
+            <option value="studio-male">Studio — Male</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="footer-row">
+        <span class="charcount" id="charcount">0 chars</span>
+        <button class="generate" id="generate-btn">دەنگی پێبدە</button>
+      </div>
+
+      <div class="status" id="status"></div>
+
+      <div class="player" id="player">
+        <audio id="audio-player" controls></audio>
+      </div>
+
+      <button class="config-toggle" id="config-toggle">advanced settings ▾</button>
+      <div class="config" id="config">
+        <div class="row">
+          <div class="field">
+            <label for="endpoint-url">RunPod endpoint URL</label>
+            <input type="text" id="endpoint-url" placeholder="https://api.runpod.ai/v2/&lt;endpoint-id&gt;/runsync" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="api-key">RunPod API key</label>
+            <input type="text" id="api-key" placeholder="rpa_..." />
+          </div>
+          <div class="field" style="max-width: 100px;">
+            <label for="speed">Speed</label>
+            <input type="number" id="speed" value="1.0" step="0.1" min="0.5" max="2.0" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>F5-TTS · aranemini/central-kurdish-tts · RunPod Serverless</footer>
+  </div>
+
+<script>
+  const genTextEl = document.getElementById('gen-text');
+  const voiceSelectEl = document.getElementById('voice-select');
+  const charcountEl = document.getElementById('charcount');
+  const generateBtn = document.getElementById('generate-btn');
+  const statusEl = document.getElementById('status');
+  const playerEl = document.getElementById('player');
+  const audioEl = document.getElementById('audio-player');
+  const configToggle = document.getElementById('config-toggle');
+  const configEl = document.getElementById('config');
+  const endpointUrlEl = document.getElementById('endpoint-url');
+  const apiKeyEl = document.getElementById('api-key');
+  const speedEl = document.getElementById('speed');
+
+  // Persist endpoint/key in memory for this session (no localStorage in this environment)
+  function updateCharcount() {
+    charcountEl.textContent = genTextEl.value.length + ' chars';
+  }
+  genTextEl.addEventListener('input', updateCharcount);
+  updateCharcount();
+
+  configToggle.addEventListener('click', () => {
+    const isShown = configEl.classList.toggle('show');
+    configToggle.textContent = isShown ? 'advanced settings ▴' : 'advanced settings ▾';
+  });
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = 'status show ' + (kind || '');
+  }
+
+  function clearStatus() {
+    statusEl.className = 'status';
+  }
+
+  generateBtn.addEventListener('click', async () => {
+    const text = genTextEl.value.trim();
+    const endpointUrl = endpointUrlEl.value.trim();
+    const apiKey = apiKeyEl.value.trim();
+    const speed = parseFloat(speedEl.value) || 1.0;
+
+    if (!text) {
+      setStatus('error: write some text first', 'error');
+      return;
+    }
+    if (!endpointUrl || !apiKey) {
+      setStatus('error: set the RunPod endpoint URL and API key in advanced settings', 'error');
+      configEl.classList.add('show');
+      configToggle.textContent = 'advanced settings ▴';
+      return;
+    }
+
+    generateBtn.disabled = true;
+    playerEl.classList.remove('show');
+    setStatus('generating audio… this can take 10-30s on a cold worker', 'busy');
+
+    try {
+      const response = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey,
+        },
+        body: JSON.stringify({
+          input: {
+            text: text,
+            voice: voiceSelectEl.value,
+            speed: speed,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status + ': ' + (await response.text()));
+      }
+
+      const data = await response.json();
+
+      // RunPod wraps the handler's return value under `output`
+      const output = data.output || data;
+
+      if (output.error) {
+        throw new Error(output.error);
+      }
+
+      if (!output.audio_base64) {
+        throw new Error('no audio_base64 field in response: ' + JSON.stringify(data).slice(0, 200));
+      }
+
+      const audioSrc = 'data:audio/wav;base64,' + output.audio_base64;
+      audioEl.src = audioSrc;
+      playerEl.classList.add('show');
+      setStatus('done', 'success');
+      audioEl.play().catch(() => {});
+
+    } catch (err) {
+      setStatus('error: ' + err.message, 'error');
+    } finally {
+      generateBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
