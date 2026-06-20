@@ -1,4 +1,4 @@
-# F5-TTS Central Kurdish — RunPod Serverless Worker
+﻿# F5-TTS Central Kurdish — RunPod Serverless Worker
 # Bakes in all 3 fine-tuned voices from aranemini/central-kurdish-tts:
 #   audiobook-female, audiobook-male, studio-male
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python
 
 WORKDIR /app
+
+# --- Upgrade packaging tools (fixes PEP 660 / editable install support) ---
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # --- PyTorch (CUDA 12.1 build) ---
 RUN pip install --no-cache-dir torch==2.4.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
