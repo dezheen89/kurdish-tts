@@ -32,30 +32,11 @@ RUN pip install --no-cache-dir runpod soundfile huggingface_hub
 # Repo: https://huggingface.co/aranemini/central-kurdish-tts
 ARG HF_REPO_ID=aranemini/central-kurdish-tts
 ARG HF_TOKEN=""
+ENV HF_REPO_ID=${HF_REPO_ID}
+ENV HF_TOKEN=${HF_TOKEN}
 
-RUN mkdir -p /app/ckpts
-RUN python -c "\
-from huggingface_hub import hf_hub_download; \
-import shutil, os; \
-token = os.environ.get('HF_TOKEN') or None; \
-repo = '${HF_REPO_ID}'; \
-files = [ \
-    'vocab.txt', \
-    'model-audiobook-female.pt', \
-    'model-audiobook-male.pt', \
-    'model-studio-male.pt', \
-    'prompt-audiobook-female.wav', \
-    'prompt-audiobook-female.txt', \
-    'prompt-audiobook-male.wav', \
-    'prompt-audiobook-male.txt', \
-    'prompt-studio-male.wav', \
-    'prompt-studio-male.txt', \
-]; \
-for fname in files: \
-    print(f'Downloading {fname} ...'); \
-    path = hf_hub_download(repo_id=repo, filename=fname, token=token); \
-    shutil.copy(path, f'/app/ckpts/{fname}'); \
-print('All files downloaded.')"
+COPY download_checkpoints.py /app/download_checkpoints.py
+RUN python /app/download_checkpoints.py
 
 ENV F5TTS_CKPT_DIR=/app/ckpts
 
