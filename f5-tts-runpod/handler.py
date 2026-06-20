@@ -20,13 +20,19 @@ Input JSON shape (sent as {"input": {...}} to the RunPod endpoint):
     "ref_text": "transcript of ref_audio",           # required if ref_audio is provided
     "speed": 1.0,                                    # optional
     "remove_silence": false                          # optional
+
+    # Debug mode (no inference run):
+    "debug": "inspect_checkpoint",                   # requires "voice" too
+    "debug": "inspect_all",                          # inspects all 3 voices
 }
 
-Output JSON shape:
+Output JSON shape (normal generation):
 {
     "audio_base64": "...",   # base64-encoded WAV bytes
     "sample_rate": 24000,
-    "voice": "audiobook-female"
+    "format": "wav",
+    "voice": "audiobook-female",
+    "warning": "..."         # only present if checkpoint keys didn't match cleanly
 }
 """
 
@@ -82,18 +88,17 @@ print(f"Loaded default voice: {DEFAULT_VOICE}")
 _state_dict_cache = {}
 
 
-def _load_voice_weights(voice_name: str):
-    """Swap the EMA model's weights to the requested voice's checkpoint."""
+def _load_voice_weights(voice_name: str) -> dict:
+    """Swap the EMA model's weights to the requested voice's checkpoint.
+    Returns a dict with mismatch info (empty if clean load)."""
     if voice_name == DEFAULT_VOICE and voice_name not in _state_dict_cache:
         # already loaded as part of F5TTS() init — nothing to do
-        return
+        return {}
 
     if voice_name not in _state_dict_cache:
         ckpt_path = VOICES[voice_name]["ckpt"]
         print(f"Loading checkpoint for voice '{voice_name}' from {ckpt_path} ...")
         raw = torch.load(ckpt_path, map_location=f5tts.device)
-        # F5-TTS finetuned checkpoints commonly store either the raw state_dict
-        # or a dict with an "ema_model_state_dict" / "model_state_dict" key.
         if isinstance(raw, dict) and "ema_model_state_dict" in raw:
             state_dict = raw["ema_model_state_dict"]
         elif isinstance(raw, dict) and "model_state_dict" in raw:
@@ -102,8 +107,44 @@ def _load_voice_weights(voice_name: str):
             state_dict = raw
         _state_dict_cache[voice_name] = state_dict
 
-    f5tts.ema_model.load_state_dict(_state_dict_cache[voice_name], strict=False)
+    incompatible = f5tts.ema_model.load_state_dict(_state_dict_cache[voice_name], strict=False)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
     f5tts.ema_model.eval()
+
+    if missing or unexpected:
+        print(
+            f"WARNING: voice '{voice_name}' checkpoint key mismatch — "
+            f"{len(missing)} missing, {len(unexpected)} unexpected. "
+            f"Sample missing: {missing[:5]} Sample unexpected: {unexpected[:5]}"
+        )
+        return {"missing_count": len(missing), "unexpected_count": len(unexpected)}
+    return {}
+
+
+def _inspect_checkpoint(voice_name: str) -> dict:
+    """Debug helper: report the raw structure of a voice's .pt file without loading it."""
+    ckpt_path = VOICES[voice_name]["ckpt"]
+    raw = torch.load(ckpt_path, map_location="cpu")
+    info = {"voice": voice_name, "ckpt_path": ckpt_path}
+    if isinstance(raw, dict):
+        info["top_level_keys"] = list(raw.keys())
+        for key in ("ema_model_state_dict", "model_state_dict"):
+            if key in raw and isinstance(raw[key], dict):
+                sub_keys = list(raw[key].keys())
+                info[f"{key}_sample"] = sub_keys[:10]
+                info[f"{key}_count"] = len(sub_keys)
+        if "ema_model_state_dict" not in raw and "model_state_dict" not in raw:
+            # raw dict might itself be the state_dict
+            sample = list(raw.keys())[:10]
+            info["raw_dict_sample_keys"] = sample
+    else:
+        info["type"] = str(type(raw))
+    # Compare against what the live model actually expects
+    expected_keys = list(f5tts.ema_model.state_dict().keys())
+    info["model_expected_sample"] = expected_keys[:10]
+    info["model_expected_count"] = len(expected_keys)
+    return info
 
 
 def _wav_bytes_to_base64(wav_path: str) -> str:
@@ -114,6 +155,26 @@ def _wav_bytes_to_base64(wav_path: str) -> str:
 
 def handler(job):
     job_input = job.get("input", {})
+
+    # Debug mode: {"input": {"debug": "inspect_checkpoint", "voice": "audiobook-male"}}
+    # Returns checkpoint structure info without running inference.
+    if job_input.get("debug") == "inspect_checkpoint":
+        voice = job_input.get("voice", DEFAULT_VOICE)
+        if voice not in VOICES:
+            return {"error": f"Unknown voice '{voice}'. Valid options: {list(VOICES.keys())}"}
+        try:
+            return {"debug_info": _inspect_checkpoint(voice)}
+        except Exception as e:
+            return {"error": f"inspect_checkpoint failed: {e}"}
+
+    if job_input.get("debug") == "inspect_all":
+        results = {}
+        for v in VOICES:
+            try:
+                results[v] = _inspect_checkpoint(v)
+            except Exception as e:
+                results[v] = {"error": str(e)}
+        return {"debug_info": results}
 
     gen_text = job_input.get("text")
     if not gen_text:
@@ -135,7 +196,7 @@ def handler(job):
 
     try:
         # Swap in the requested voice's model weights
-        _load_voice_weights(voice)
+        mismatch_info = _load_voice_weights(voice)
 
         if ref_audio_b64:
             # caller supplied their own reference clip — overrides the built-in voice prompt
@@ -171,12 +232,20 @@ def handler(job):
         audio_b64 = _wav_bytes_to_base64(out_path)
         os.remove(out_path)
 
-        return {
+        result = {
             "audio_base64": audio_b64,
             "sample_rate": sr,
             "format": "wav",
             "voice": voice,
         }
+        if mismatch_info:
+            result["warning"] = (
+                f"checkpoint key mismatch for voice '{voice}': "
+                f"{mismatch_info['missing_count']} missing, "
+                f"{mismatch_info['unexpected_count']} unexpected — "
+                f"audio may not reflect the requested voice correctly"
+            )
+        return result
 
     except Exception as e:
         return {"error": str(e)}
