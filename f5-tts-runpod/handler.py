@@ -24,6 +24,7 @@ Input JSON shape (sent as {"input": {...}} to the RunPod endpoint):
     # Debug mode (no inference run):
     "debug": "inspect_checkpoint",                   # requires "voice" too
     "debug": "inspect_all",                          # inspects all 3 voices
+    "debug": "show_ref_text",                        # NEW: returns the baked-in ref_text for each voice
 }
 
 Output JSON shape (normal generation):
@@ -32,6 +33,7 @@ Output JSON shape (normal generation):
     "sample_rate": 24000,
     "format": "wav",
     "voice": "audiobook-female",
+    "active_voice": "audiobook-female",  # which weights are actually loaded — sanity check
     "warning": "..."         # only present if checkpoint keys didn't match cleanly
 }
 """
@@ -87,18 +89,18 @@ print(f"Loaded default voice: {DEFAULT_VOICE}")
 # Cache of loaded state_dicts per voice so repeated calls don't re-read from disk
 _state_dict_cache = {}
 
+# Track which voice's weights are CURRENTLY live in f5tts.ema_model.
+# This is the core fix: without tracking actual state, the old code would
+# leave the wrong voice loaded after any non-default voice was used.
+_active_voice = DEFAULT_VOICE
 
-def _load_voice_weights(voice_name: str) -> dict:
-    """Swap the EMA model's weights to the requested voice's checkpoint.
-    Returns a dict with mismatch info (empty if clean load)."""
-    if voice_name == DEFAULT_VOICE and voice_name not in _state_dict_cache:
-        # already loaded as part of F5TTS() init — nothing to do
-        return {}
 
+def _read_state_dict(voice_name: str) -> dict:
+    """Read (and cache) the EMA/model state_dict for a voice from disk."""
     if voice_name not in _state_dict_cache:
         ckpt_path = VOICES[voice_name]["ckpt"]
         print(f"Loading checkpoint for voice '{voice_name}' from {ckpt_path} ...")
-        raw = torch.load(ckpt_path, map_location=f5tts.device)
+        raw = torch.load(ckpt_path, map_location=f5tts.device, weights_only=False)
         if isinstance(raw, dict) and "ema_model_state_dict" in raw:
             state_dict = raw["ema_model_state_dict"]
         elif isinstance(raw, dict) and "model_state_dict" in raw:
@@ -106,11 +108,31 @@ def _load_voice_weights(voice_name: str) -> dict:
         else:
             state_dict = raw
         _state_dict_cache[voice_name] = state_dict
+    return _state_dict_cache[voice_name]
 
-    incompatible = f5tts.ema_model.load_state_dict(_state_dict_cache[voice_name], strict=False)
+
+def _load_voice_weights(voice_name: str) -> dict:
+    """Ensure the EMA model's weights match the requested voice.
+    Returns a dict with mismatch info (empty if clean load).
+
+    FIX: previously this short-circuited for DEFAULT_VOICE and never reloaded
+    it, so once another voice was swapped in, requests for the default voice
+    kept the WRONG weights. Now we track _active_voice and only skip the
+    reload when the requested voice is genuinely already live."""
+    global _active_voice
+
+    # Already the live voice — nothing to do.
+    if voice_name == _active_voice:
+        return {}
+
+    state_dict = _read_state_dict(voice_name)
+
+    incompatible = f5tts.ema_model.load_state_dict(state_dict, strict=False)
     missing = list(getattr(incompatible, "missing_keys", []))
     unexpected = list(getattr(incompatible, "unexpected_keys", []))
     f5tts.ema_model.eval()
+
+    _active_voice = voice_name  # record the swap
 
     if missing or unexpected:
         print(
@@ -125,7 +147,7 @@ def _load_voice_weights(voice_name: str) -> dict:
 def _inspect_checkpoint(voice_name: str) -> dict:
     """Debug helper: report the raw structure of a voice's .pt file without loading it."""
     ckpt_path = VOICES[voice_name]["ckpt"]
-    raw = torch.load(ckpt_path, map_location="cpu")
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     info = {"voice": voice_name, "ckpt_path": ckpt_path}
     if isinstance(raw, dict):
         info["top_level_keys"] = list(raw.keys())
@@ -176,6 +198,22 @@ def handler(job):
                 results[v] = {"error": str(e)}
         return {"debug_info": results}
 
+    # NEW debug mode: dump the baked-in reference transcript for each voice.
+    # Use this to confirm whether your prompt-*.txt files are Sorani Arabic
+    # script or Latin — this is what determines if generated text matches.
+    if job_input.get("debug") == "show_ref_text":
+        return {
+            "debug_info": {
+                v: {
+                    "ref_text": cfg["ref_text"],
+                    "ref_text_file": cfg["ref_text_file"],
+                    "ref_audio": cfg["ref_audio"],
+                    "ref_audio_exists": os.path.exists(cfg["ref_audio"]),
+                }
+                for v, cfg in VOICES.items()
+            }
+        }
+
     gen_text = job_input.get("text")
     if not gen_text:
         return {"error": "Missing required field: 'text'"}
@@ -195,7 +233,7 @@ def handler(job):
     tmp_file_to_clean = None
 
     try:
-        # Swap in the requested voice's model weights
+        # Swap in the requested voice's model weights (now always correct).
         mismatch_info = _load_voice_weights(voice)
 
         if ref_audio_b64:
@@ -237,6 +275,7 @@ def handler(job):
             "sample_rate": sr,
             "format": "wav",
             "voice": voice,
+            "active_voice": _active_voice,  # sanity check: should equal "voice"
         }
         if mismatch_info:
             result["warning"] = (
