@@ -11,36 +11,33 @@ Each voice has its own checkpoint (.pt) + its own reference audio/text
 the same vocab.txt and F5TTS_v1_Base architecture, so only one vocoder
 needs to be loaded — we swap the EMA model weights per request/voice.
 
-Input JSON shape (sent as {"input": {...}} to the RunPod endpoint):
-{
-    "text": "Kurdish text to synthesize",          # required
-    "voice": "audiobook-female",                    # optional, default "audiobook-female"
-                                                      # one of: audiobook-female | audiobook-male | studio-male
-    "ref_audio": "base64-or-omit",                  # optional, base64 wav — overrides the built-in voice prompt
-    "ref_text": "transcript of ref_audio",           # required if ref_audio is provided
-    "speed": 1.0,                                    # optional
-    "remove_silence": false                          # optional
+----------------------------------------------------------------------------
+WHAT WAS WRONG (and is now fixed)
+----------------------------------------------------------------------------
+The previous version swapped voice weights with:
 
-    # Debug mode (no inference run):
-    "debug": "inspect_checkpoint",                   # requires "voice" too
-    "debug": "inspect_all",                          # inspects all 3 voices
-    "debug": "show_ref_text",                        # NEW: returns the baked-in ref_text for each voice
-}
+    f5tts.ema_model.load_state_dict(state_dict, strict=False)
 
-Output JSON shape (normal generation):
-{
-    "audio_base64": "...",   # base64-encoded WAV bytes
-    "sample_rate": 24000,
-    "format": "wav",
-    "voice": "audiobook-female",
-    "active_voice": "audiobook-female",  # which weights are actually loaded — sanity check
-    "warning": "..."         # only present if checkpoint keys didn't match cleanly
-}
+`strict=False` SILENTLY tolerates key-name mismatches. If a checkpoint's
+keys don't line up exactly with the live model's keys (common with EMA
+checkpoints that carry an "ema_model." prefix, or bookkeeping keys like
+"initted"/"step"/"ema."), the call loads only the keys that happen to
+match — often ZERO — and leaves the rest of the model holding the PREVIOUS
+voice's weights. Result: audio that is generated from your text but sounds
+garbled / mismatched, because it's a Frankenstein of two checkpoints.
+
+The fix:
+  1. Normalize checkpoint keys (strip common EMA wrapper prefixes, drop
+     non-parameter bookkeeping keys) so they line up with the live model.
+  2. Load and then VERIFY: if too many keys are still missing, RAISE instead
+     of returning silently-wrong audio.
+----------------------------------------------------------------------------
 """
 
 import base64
 import os
 import tempfile
+import threading
 
 import runpod
 import torch
@@ -69,6 +66,10 @@ VOICES = {
 }
 DEFAULT_VOICE = "audiobook-female"
 
+# If fewer than this fraction of the model's parameters get loaded from a
+# checkpoint, we treat the swap as failed (wrong/garbled voice) and raise.
+MIN_LOAD_FRACTION = 0.98
+
 # Read each voice's reference transcript once at startup
 for _voice, _cfg in VOICES.items():
     if os.path.exists(_cfg["ref_text_file"]):
@@ -86,61 +87,116 @@ f5tts = F5TTS(
 )
 print(f"Loaded default voice: {DEFAULT_VOICE}")
 
-# Cache of loaded state_dicts per voice so repeated calls don't re-read from disk
+# Cache of normalized state_dicts per voice so repeated calls don't re-read from disk
 _state_dict_cache = {}
 
 # Track which voice's weights are CURRENTLY live in f5tts.ema_model.
-# This is the core fix: without tracking actual state, the old code would
-# leave the wrong voice loaded after any non-default voice was used.
 _active_voice = DEFAULT_VOICE
+
+# Serialize the swap+infer critical section. Even with max_workers=1 a single
+# worker can be asked to handle requests back-to-back; this guarantees no
+# request ever runs inference while another is mid-swap.
+_infer_lock = threading.RLock()
+
+
+def _normalize_state_dict(state_dict: dict, model_keys: set) -> dict:
+    """Make a checkpoint's keys line up with the live model's keys.
+
+    Handles the common cases:
+      - keys wrapped with an 'ema_model.' / 'ema.' / 'module.' prefix
+      - bookkeeping entries that aren't real parameters (initted, step, etc.)
+
+    Returns a new dict containing only keys the model actually expects.
+    """
+    # Drop obvious non-parameter bookkeeping keys.
+    junk = {"initted", "step", "ema.initted", "ema.step"}
+    cleaned = {k: v for k, v in state_dict.items() if k not in junk}
+
+    # If keys already match, nothing to do.
+    if any(k in model_keys for k in cleaned):
+        already = sum(1 for k in cleaned if k in model_keys)
+        # If a healthy majority already match, keep as-is.
+        if already >= len(model_keys) * MIN_LOAD_FRACTION:
+            return cleaned
+
+    # Try stripping known wrapper prefixes until keys line up.
+    for prefix in ("ema_model.", "ema.", "module.", "model."):
+        stripped = {
+            (k[len(prefix):] if k.startswith(prefix) else k): v
+            for k, v in cleaned.items()
+        }
+        match_count = sum(1 for k in stripped if k in model_keys)
+        if match_count >= len(model_keys) * MIN_LOAD_FRACTION:
+            return stripped
+
+    # Nothing lined up cleanly — return cleaned and let the verifier raise.
+    return cleaned
 
 
 def _read_state_dict(voice_name: str) -> dict:
-    """Read (and cache) the EMA/model state_dict for a voice from disk."""
+    """Read, normalize, and cache the EMA/model state_dict for a voice."""
     if voice_name not in _state_dict_cache:
         ckpt_path = VOICES[voice_name]["ckpt"]
         print(f"Loading checkpoint for voice '{voice_name}' from {ckpt_path} ...")
-        raw = torch.load(ckpt_path, map_location=f5tts.device, weights_only=False)
+        # Load to CPU first; we move tensors to device at load_state_dict time.
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if isinstance(raw, dict) and "ema_model_state_dict" in raw:
             state_dict = raw["ema_model_state_dict"]
         elif isinstance(raw, dict) and "model_state_dict" in raw:
             state_dict = raw["model_state_dict"]
         else:
             state_dict = raw
+
+        model_keys = set(f5tts.ema_model.state_dict().keys())
+        state_dict = _normalize_state_dict(state_dict, model_keys)
         _state_dict_cache[voice_name] = state_dict
     return _state_dict_cache[voice_name]
 
 
 def _load_voice_weights(voice_name: str) -> dict:
     """Ensure the EMA model's weights match the requested voice.
-    Returns a dict with mismatch info (empty if clean load).
 
-    FIX: previously this short-circuited for DEFAULT_VOICE and never reloaded
-    it, so once another voice was swapped in, requests for the default voice
-    kept the WRONG weights. Now we track _active_voice and only skip the
-    reload when the requested voice is genuinely already live."""
+    Loads STRICTLY-VERIFIED: if the checkpoint fails to populate essentially
+    all of the model's parameters, we RAISE rather than emit garbled audio.
+    Returns a dict with (benign) mismatch info; empty if perfectly clean.
+    """
     global _active_voice
 
-    # Already the live voice — nothing to do.
     if voice_name == _active_voice:
         return {}
 
     state_dict = _read_state_dict(voice_name)
+    model_keys = set(f5tts.ema_model.state_dict().keys())
 
     incompatible = f5tts.ema_model.load_state_dict(state_dict, strict=False)
     missing = list(getattr(incompatible, "missing_keys", []))
     unexpected = list(getattr(incompatible, "unexpected_keys", []))
-    f5tts.ema_model.eval()
 
-    _active_voice = voice_name  # record the swap
+    loaded = len(model_keys) - len(missing)
+    load_fraction = loaded / max(1, len(model_keys))
+
+    if load_fraction < MIN_LOAD_FRACTION:
+        # The swap did NOT really happen. Refuse to produce wrong-voice audio.
+        raise RuntimeError(
+            f"Voice swap to '{voice_name}' FAILED: only {loaded}/{len(model_keys)} "
+            f"params loaded ({load_fraction:.1%}). This means the checkpoint keys "
+            f"do not match the model. Sample missing: {missing[:5]} | "
+            f"Sample unexpected (in ckpt, not model): {unexpected[:5]}. "
+            f"Fix _normalize_state_dict prefix handling for this checkpoint."
+        )
+
+    f5tts.ema_model.eval()
+    _active_voice = voice_name
 
     if missing or unexpected:
+        # A handful of non-critical keys differing is tolerable past the threshold.
         print(
-            f"WARNING: voice '{voice_name}' checkpoint key mismatch — "
-            f"{len(missing)} missing, {len(unexpected)} unexpected. "
-            f"Sample missing: {missing[:5]} Sample unexpected: {unexpected[:5]}"
+            f"NOTE: voice '{voice_name}' loaded with minor key diff — "
+            f"{len(missing)} missing, {len(unexpected)} unexpected "
+            f"(loaded {load_fraction:.1%}). Proceeding."
         )
-        return {"missing_count": len(missing), "unexpected_count": len(unexpected)}
+        return {"missing_count": len(missing), "unexpected_count": len(unexpected),
+                "load_fraction": round(load_fraction, 4)}
     return {}
 
 
@@ -157,12 +213,10 @@ def _inspect_checkpoint(voice_name: str) -> dict:
                 info[f"{key}_sample"] = sub_keys[:10]
                 info[f"{key}_count"] = len(sub_keys)
         if "ema_model_state_dict" not in raw and "model_state_dict" not in raw:
-            # raw dict might itself be the state_dict
             sample = list(raw.keys())[:10]
             info["raw_dict_sample_keys"] = sample
     else:
         info["type"] = str(type(raw))
-    # Compare against what the live model actually expects
     expected_keys = list(f5tts.ema_model.state_dict().keys())
     info["model_expected_sample"] = expected_keys[:10]
     info["model_expected_count"] = len(expected_keys)
@@ -178,8 +232,6 @@ def _wav_bytes_to_base64(wav_path: str) -> str:
 def handler(job):
     job_input = job.get("input", {})
 
-    # Debug mode: {"input": {"debug": "inspect_checkpoint", "voice": "audiobook-male"}}
-    # Returns checkpoint structure info without running inference.
     if job_input.get("debug") == "inspect_checkpoint":
         voice = job_input.get("voice", DEFAULT_VOICE)
         if voice not in VOICES:
@@ -198,9 +250,6 @@ def handler(job):
                 results[v] = {"error": str(e)}
         return {"debug_info": results}
 
-    # NEW debug mode: dump the baked-in reference transcript for each voice.
-    # Use this to confirm whether your prompt-*.txt files are Sorani Arabic
-    # script or Latin — this is what determines if generated text matches.
     if job_input.get("debug") == "show_ref_text":
         return {
             "debug_info": {
@@ -232,66 +281,67 @@ def handler(job):
     tmp_ref_path = voice_cfg["ref_audio"]
     tmp_file_to_clean = None
 
-    try:
-        # Swap in the requested voice's model weights (now always correct).
-        mismatch_info = _load_voice_weights(voice)
+    # Hold the lock across the WHOLE swap+infer so a concurrent request can't
+    # change the live weights out from under us mid-generation.
+    with _infer_lock:
+        try:
+            mismatch_info = _load_voice_weights(voice)
 
-        if ref_audio_b64:
-            # caller supplied their own reference clip — overrides the built-in voice prompt
-            if not ref_text:
-                return {"error": "ref_text is required when ref_audio is provided"}
-            audio_bytes = base64.b64decode(ref_audio_b64)
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.write(audio_bytes)
-            tmp.close()
-            tmp_ref_path = tmp.name
-            tmp_file_to_clean = tmp.name
-        else:
-            ref_text = ref_text or voice_cfg["ref_text"]
-            if not os.path.exists(tmp_ref_path):
-                return {"error": f"Built-in reference audio missing for voice '{voice}': {tmp_ref_path}"}
-            if not ref_text:
-                return {"error": f"No ref_text available for voice '{voice}'"}
+            if ref_audio_b64:
+                if not ref_text:
+                    return {"error": "ref_text is required when ref_audio is provided"}
+                audio_bytes = base64.b64decode(ref_audio_b64)
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.write(audio_bytes)
+                tmp.close()
+                tmp_ref_path = tmp.name
+                tmp_file_to_clean = tmp.name
+            else:
+                ref_text = ref_text or voice_cfg["ref_text"]
+                if not os.path.exists(tmp_ref_path):
+                    return {"error": f"Built-in reference audio missing for voice '{voice}': {tmp_ref_path}"}
+                if not ref_text:
+                    return {"error": f"No ref_text available for voice '{voice}'"}
 
-        out_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        out_path = out_tmp.name
-        out_tmp.close()
+            out_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            out_path = out_tmp.name
+            out_tmp.close()
 
-        wav, sr, _ = f5tts.infer(
-            ref_file=tmp_ref_path,
-            ref_text=ref_text,
-            gen_text=gen_text,
-            speed=speed,
-            remove_silence=remove_silence,
-            file_wave=out_path,
-            seed=job_input.get("seed"),
-        )
-
-        audio_b64 = _wav_bytes_to_base64(out_path)
-        os.remove(out_path)
-
-        result = {
-            "audio_base64": audio_b64,
-            "sample_rate": sr,
-            "format": "wav",
-            "voice": voice,
-            "active_voice": _active_voice,  # sanity check: should equal "voice"
-        }
-        if mismatch_info:
-            result["warning"] = (
-                f"checkpoint key mismatch for voice '{voice}': "
-                f"{mismatch_info['missing_count']} missing, "
-                f"{mismatch_info['unexpected_count']} unexpected — "
-                f"audio may not reflect the requested voice correctly"
+            wav, sr, _ = f5tts.infer(
+                ref_file=tmp_ref_path,
+                ref_text=ref_text,
+                gen_text=gen_text,
+                speed=speed,
+                remove_silence=remove_silence,
+                file_wave=out_path,
+                seed=job_input.get("seed"),
             )
-        return result
 
-    except Exception as e:
-        return {"error": str(e)}
+            audio_b64 = _wav_bytes_to_base64(out_path)
+            os.remove(out_path)
 
-    finally:
-        if tmp_file_to_clean and os.path.exists(tmp_file_to_clean):
-            os.remove(tmp_file_to_clean)
+            result = {
+                "audio_base64": audio_b64,
+                "sample_rate": sr,
+                "format": "wav",
+                "voice": voice,
+                "active_voice": _active_voice,  # sanity check: should equal "voice"
+            }
+            if mismatch_info:
+                result["warning"] = (
+                    f"checkpoint key diff for voice '{voice}': "
+                    f"{mismatch_info['missing_count']} missing, "
+                    f"{mismatch_info['unexpected_count']} unexpected "
+                    f"(loaded {mismatch_info.get('load_fraction')})"
+                )
+            return result
+
+        except Exception as e:
+            return {"error": str(e)}
+
+        finally:
+            if tmp_file_to_clean and os.path.exists(tmp_file_to_clean):
+                os.remove(tmp_file_to_clean)
 
 
 runpod.serverless.start({"handler": handler})
