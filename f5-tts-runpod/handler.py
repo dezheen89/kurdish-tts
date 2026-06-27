@@ -36,6 +36,7 @@ The fix:
 
 import base64
 import os
+import re
 import tempfile
 import threading
 
@@ -44,8 +45,73 @@ import torch
 
 from f5_tts.api import F5TTS
 
+try:
+    import asosoft
+except ImportError as e:
+    raise ImportError(
+        "The 'asosoft' package is required to preprocess Kurdish text before "
+        "F5-TTS inference (the model was trained on phonemized text, not raw "
+        "Kurdish script). Add `pip install asosoft` to the Dockerfile."
+    ) from e
+
 CKPT_DIR = os.environ.get("F5TTS_CKPT_DIR", "/app/ckpts")
 VOCAB_FILE = os.path.join(CKPT_DIR, "vocab.txt")
+
+# ----------------------------------------------------------------------------
+# TEXT PREPROCESSING — mirrors the model author's own infer.py EXACTLY.
+#
+# The model was NOT trained on raw Kurdish script. It was trained on a
+# phonemized form produced by the `asosoft` library's Kurdish G2P (grapheme-
+# to-phoneme) converter. Skipping this step is why text didn't match audio:
+# raw Kurdish letters (پ چ ێ ۆ ...) aren't even tokens the model has any
+# learned meaning for — only the phonemized output is.
+#
+# This MUST be applied to both `gen_text` (what the user wants spoken) and
+# `ref_text` (the transcript of the reference/prompt audio) before either
+# is handed to f5tts.infer().
+# ----------------------------------------------------------------------------
+
+_G2P_REPLACEMENTS = {
+    "ل؛چ": "د‡",
+    "ئ¹": "آ؟",
+    "ل¸§": "ل¸¥",
+}
+
+
+def normalize_and_g2p(text: str) -> str:
+    """Convert raw Kurdish text into the phonemic form the model expects.
+    Mirrors aranemini/central-kurdish-tts's infer.py normalize_and_g2p()."""
+    text = re.sub(r"(\d{1,8})\s*[-\u2013]\s*(\d{1,8})", r"\1 \u0637\u0647\u0637\u0627 \2", text)
+
+    text = re.sub(
+        r"\b\d{9,}\b",
+        lambda m: f"<NUM:{m.group(0)}>",
+        text,
+    )
+
+    norm = asosoft.Normalize(
+        text,
+        changeInitialR=True,
+        deepUnicodeCorrectios=True,
+        additionalUnicodeCorrections=True,
+    )
+
+    norm = asosoft.NormalizePunctuations(
+        norm,
+        seprateAllPunctuations=True,
+    )
+
+    try:
+        norm = asosoft.Number2Word(norm)
+    except Exception as e:
+        print(f"[Number2Word Error] Skipping conversion: {e}")
+
+    g2p = asosoft.KurdishG2P(norm).replace("\u062b\u02c6", "")
+
+    for old, new in _G2P_REPLACEMENTS.items():
+        g2p = g2p.replace(old, new)
+
+    return g2p
 
 VOICES = {
     "audiobook-female": {
@@ -70,12 +136,16 @@ DEFAULT_VOICE = "audiobook-female"
 # checkpoint, we treat the swap as failed (wrong/garbled voice) and raise.
 MIN_LOAD_FRACTION = 0.98
 
-# Read each voice's reference transcript once at startup
+# Read each voice's reference transcript once at startup, and immediately
+# convert it to the phonemic form the model expects (same as gen_text).
 for _voice, _cfg in VOICES.items():
     if os.path.exists(_cfg["ref_text_file"]):
         with open(_cfg["ref_text_file"], "r", encoding="utf-8") as f:
-            _cfg["ref_text"] = f.read().strip()
+            _raw_ref_text = f.read().strip()
+        _cfg["ref_text_raw"] = _raw_ref_text
+        _cfg["ref_text"] = normalize_and_g2p(_raw_ref_text) if _raw_ref_text else None
     else:
+        _cfg["ref_text_raw"] = None
         _cfg["ref_text"] = None
 
 print("Loading F5-TTS (vocoder + base model)...")
@@ -223,6 +293,69 @@ def _inspect_checkpoint(voice_name: str) -> dict:
     return info
 
 
+def _diagnose_vocab() -> dict:
+    """Compare vocab.txt against the live model's text-embedding size, and
+    report Kurdish character coverage. Pinpoints why text != audio."""
+    kurdish_letters = [
+        ("\u067e", "p"), ("\u0686", "ch"), ("\u0698", "zh"),
+        ("\u06af", "g"), ("\u0695", "rr"), ("\u06a4", "v"),
+        ("\u06c6", "o"), ("\u06ce", "e-circ"), ("\u06be", "h2"),
+        ("\u06d5", "e"), ("\u0626", "hamza-yeh"), ("\u06cc", "y/i"),
+        ("\u06a9", "k-farsi"), ("\u06b5", "ll"),
+    ]
+
+    # Read vocab.txt (one token per line; order defines index).
+    with open(VOCAB_FILE, "r", encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    vocab_count = len(lines)
+    vocab_set = set(lines)
+
+    # Find the live model's text-embedding matrix and read its row count.
+    emb_rows = None
+    emb_key = None
+    for k, v in f5tts.ema_model.state_dict().items():
+        if hasattr(v, "shape") and len(v.shape) == 2 and "text_embed" in k.lower():
+            emb_key = k
+            emb_rows = int(v.shape[0])
+            break
+    if emb_rows is None:
+        for k, v in f5tts.ema_model.state_dict().items():
+            if hasattr(v, "shape") and len(v.shape) == 2 and "embed" in k.lower():
+                emb_key = k
+                emb_rows = int(v.shape[0])
+                break
+
+    coverage = {ch: (ch in vocab_set) for ch, _ in kurdish_letters}
+    missing = [ch for ch, ok in coverage.items() if not ok]
+
+    size_matches = emb_rows is not None and emb_rows in (vocab_count, vocab_count + 1)
+
+    if not size_matches:
+        verdict = ("EMBEDDING SIZE MISMATCH: vocab.txt is the WRONG FILE for this "
+                   "checkpoint. Replace vocab.txt with the one trained alongside "
+                   "these weights, then rebuild.")
+    elif missing:
+        verdict = ("Embedding size matches but Kurdish letters are missing from "
+                   "vocab. The model expects NORMALIZED text — apply the author's "
+                   "standardization to gen_text before infer().")
+    else:
+        verdict = ("vocab.txt and checkpoint agree and all Kurdish letters are "
+                   "present. Look elsewhere (ref-text exactness / swap).")
+
+    return {
+        "vocab_file": VOCAB_FILE,
+        "vocab_token_count": vocab_count,
+        "embedding_key": emb_key,
+        "embedding_rows": emb_rows,
+        "embedding_matches_vocab": size_matches,
+        "kurdish_coverage": coverage,
+        "kurdish_missing": missing,
+        "verdict": verdict,
+    }
+
+
 def _wav_bytes_to_base64(wav_path: str) -> str:
     with open(wav_path, "rb") as f:
         data = f.read()
@@ -254,7 +387,8 @@ def handler(job):
         return {
             "debug_info": {
                 v: {
-                    "ref_text": cfg["ref_text"],
+                    "ref_text_raw": cfg.get("ref_text_raw"),
+                    "ref_text_phonemized": cfg["ref_text"],
                     "ref_text_file": cfg["ref_text_file"],
                     "ref_audio": cfg["ref_audio"],
                     "ref_audio_exists": os.path.exists(cfg["ref_audio"]),
@@ -263,8 +397,28 @@ def handler(job):
             }
         }
 
-    gen_text = job_input.get("text")
-    if not gen_text:
+    # New debug mode: run normalize_and_g2p on arbitrary text without doing
+    # inference. Use this to sanity-check the phonemizer output directly:
+    #   {"input": {"debug": "test_g2p", "text": "سپاس بۆ هەوڵ"}}
+    if job_input.get("debug") == "test_g2p":
+        sample = job_input.get("text", "سپاس بۆ هەوڵ یا هاتین")
+        try:
+            return {"debug_info": {"raw": sample, "phonemized": normalize_and_g2p(sample)}}
+        except Exception as e:
+            return {"error": f"test_g2p failed: {e}"}
+
+    # Diagnose the vocab/checkpoint relationship. Call:
+    #   {"input": {"debug": "diagnose_vocab"}}
+    # Tells you whether vocab.txt matches the checkpoint's text-embedding size,
+    # and whether the Kurdish letters your users type are even in the vocab.
+    if job_input.get("debug") == "diagnose_vocab":
+        try:
+            return {"debug_info": _diagnose_vocab()}
+        except Exception as e:
+            return {"error": f"diagnose_vocab failed: {e}"}
+
+    gen_text_raw = job_input.get("text")
+    if not gen_text_raw:
         return {"error": "Missing required field: 'text'"}
 
     voice = job_input.get("voice", DEFAULT_VOICE)
@@ -275,11 +429,20 @@ def handler(job):
     remove_silence = bool(job_input.get("remove_silence", False))
 
     ref_audio_b64 = job_input.get("ref_audio")
-    ref_text = job_input.get("ref_text")
+    ref_text_raw_input = job_input.get("ref_text")
 
     voice_cfg = VOICES[voice]
     tmp_ref_path = voice_cfg["ref_audio"]
     tmp_file_to_clean = None
+
+    # Convert the user's raw Kurdish text into the phonemic form the model
+    # was actually trained on. THIS is the step that was missing before —
+    # without it the model receives characters it has no learned meaning
+    # for, which is why generated audio didn't match the input text.
+    try:
+        gen_text = normalize_and_g2p(gen_text_raw)
+    except Exception as e:
+        return {"error": f"G2P preprocessing failed for 'text': {e}"}
 
     # Hold the lock across the WHOLE swap+infer so a concurrent request can't
     # change the live weights out from under us mid-generation.
@@ -288,8 +451,14 @@ def handler(job):
             mismatch_info = _load_voice_weights(voice)
 
             if ref_audio_b64:
-                if not ref_text:
+                if not ref_text_raw_input:
                     return {"error": "ref_text is required when ref_audio is provided"}
+                # Caller-supplied ref_text is raw text too — phonemize it the
+                # same way, so it matches what the model expects.
+                try:
+                    ref_text = normalize_and_g2p(ref_text_raw_input)
+                except Exception as e:
+                    return {"error": f"G2P preprocessing failed for 'ref_text': {e}"}
                 audio_bytes = base64.b64decode(ref_audio_b64)
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 tmp.write(audio_bytes)
@@ -297,7 +466,9 @@ def handler(job):
                 tmp_ref_path = tmp.name
                 tmp_file_to_clean = tmp.name
             else:
-                ref_text = ref_text or voice_cfg["ref_text"]
+                # voice_cfg["ref_text"] was ALREADY phonemized once at
+                # startup (see the loading loop above) — do not re-process it.
+                ref_text = voice_cfg["ref_text"]
                 if not os.path.exists(tmp_ref_path):
                     return {"error": f"Built-in reference audio missing for voice '{voice}': {tmp_ref_path}"}
                 if not ref_text:
@@ -326,6 +497,7 @@ def handler(job):
                 "format": "wav",
                 "voice": voice,
                 "active_voice": _active_voice,  # sanity check: should equal "voice"
+                "gen_text_phonemized": gen_text,  # sanity check: G2P actually ran
             }
             if mismatch_info:
                 result["warning"] = (
