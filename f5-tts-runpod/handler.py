@@ -81,7 +81,16 @@ _G2P_REPLACEMENTS = {
 def normalize_and_g2p(text: str) -> str:
     """Convert raw Kurdish text into the phonemic form the model expects.
     Mirrors aranemini/central-kurdish-tts's infer.py normalize_and_g2p()."""
-    text = re.sub(r"(\d{1,8})\s*[-\u2013]\s*(\d{1,8})", r"\1 \u0637\u0647\u0637\u0627 \2", text)
+    # NOTE: must use a callback here, not a replacement string — re.sub's
+    # template parser does its own backslash handling and does NOT support
+    # \uXXXX escapes (that crashed with "bad escape \u"). A callback's
+    # return value is inserted verbatim, so Python's own (correct) Unicode
+    # escape handling applies instead.
+    text = re.sub(
+        r"(\d{1,8})\s*[-\u2013]\s*(\d{1,8})",
+        lambda m: f"{m.group(1)} \u0637\u0647\u0637\u0627 {m.group(2)}",
+        text,
+    )
 
     text = re.sub(
         r"\b\d{9,}\b",
