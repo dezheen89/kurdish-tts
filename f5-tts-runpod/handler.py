@@ -11,6 +11,7 @@ Each voice has its own checkpoint (.pt) + its own reference audio/text
 the same vocab.txt and F5TTS_v1_Base architecture, so only one vocoder
 needs to be loaded — we swap the EMA model weights per request/voice.
 
+
 ----------------------------------------------------------------------------
 WHAT WAS WRONG (and is now fixed)
 ----------------------------------------------------------------------------
