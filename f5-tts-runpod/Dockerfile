@@ -1,4 +1,4 @@
-﻿# F5-TTS Central Kurdish — RunPod Serverless Worker
+# F5-TTS Central Kurdish — RunPod Serverless Worker
 # Bakes in all 3 fine-tuned voices from aranemini/central-kurdish-tts:
 #   audiobook-female, audiobook-male, studio-male
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
@@ -27,6 +27,14 @@ RUN pip install --no-cache-dir -e /app/F5-TTS-main
 
 # --- RunPod SDK + extras ---
 RUN pip install --no-cache-dir runpod soundfile huggingface_hub
+
+# --- Kurdish text preprocessing (G2P) ---
+# The Kurdish checkpoints were trained on PHONEMIZED text, not raw Kurdish
+# script. asosoft.KurdishG2P() converts raw Kurdish into that phonemic form
+# before it ever reaches the model — this is the step that was missing and
+# caused generated audio to not match the input text. See handler.py's
+# normalize_and_g2p(), which mirrors the model author's own infer.py.
+RUN pip install --no-cache-dir asosoft
 
 # --- Kurdish TTS checkpoints (3 voices, ~5.39 GB each = ~16 GB total) ---
 # Repo: https://huggingface.co/aranemini/central-kurdish-tts
