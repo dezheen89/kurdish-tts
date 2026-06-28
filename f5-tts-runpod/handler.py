@@ -11,7 +11,6 @@ Each voice has its own checkpoint (.pt) + its own reference audio/text
 the same vocab.txt and F5TTS_v1_Base architecture, so only one vocoder
 needs to be loaded — we swap the EMA model weights per request/voice.
 
-
 ----------------------------------------------------------------------------
 WHAT WAS WRONG (and is now fixed)
 ----------------------------------------------------------------------------
@@ -73,9 +72,9 @@ VOCAB_FILE = os.path.join(CKPT_DIR, "vocab.txt")
 # ----------------------------------------------------------------------------
 
 _G2P_REPLACEMENTS = {
-    "ل؛چ": "د‡",
-    "ئ¹": "آ؟",
-    "ل¸§": "ل¸¥",
+    "\u1e8d": "\u03c7",   # ẍ -> χ
+    "\u01b9": "\u00bf",   # ƹ -> ¿
+    "\u1e27": "\u1e25",   # ḧ -> ḥ
 }
 
 
@@ -89,7 +88,7 @@ def normalize_and_g2p(text: str) -> str:
     # escape handling applies instead.
     text = re.sub(
         r"(\d{1,8})\s*[-\u2013]\s*(\d{1,8})",
-        lambda m: f"{m.group(1)} \u0637\u0647\u0637\u0627 {m.group(2)}",
+        lambda m: f"{m.group(1)} \u062a\u0627 {m.group(2)}",  # "تا" (Kurdish "to")
         text,
     )
 
@@ -116,7 +115,7 @@ def normalize_and_g2p(text: str) -> str:
     except Exception as e:
         print(f"[Number2Word Error] Skipping conversion: {e}")
 
-    g2p = asosoft.KurdishG2P(norm).replace("\u062b\u02c6", "")
+    g2p = asosoft.KurdishG2P(norm).replace("\u02c8", "")  # strip IPA primary stress mark ˈ
 
     for old, new in _G2P_REPLACEMENTS.items():
         g2p = g2p.replace(old, new)
